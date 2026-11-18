@@ -1,0 +1,7 @@
+poi.db
+__pycache__/
+venv/
+.env
+build/
+dist/
+*.spec
