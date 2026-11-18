@@ -12,6 +12,7 @@
   };
   var PICK_COLOR = '#e4572e';
 
+  var LOCAL = window.POI_MODE === 'local';   // true = standalone phone mode (no Flask server)
   var locations = Array.isArray(window.INITIAL_POI) ? window.INITIAL_POI : [];
   var markers = {};          // saved location id -> marker
   var pickedMarker = null;   // the pin for the location you are adding
@@ -58,21 +59,121 @@
   function setStatus(text, isError) {
     geoStatus.textContent = text || '';
     geoStatus.className = 'status' + (isError ? ' error' : '');
+    if (typeof updateSheet === 'function') updateSheet();
   }
 
+  var toastEl = $('toast');
+  var toastTimer = null;
   function showMessage(text, kind) {
     message.textContent = text;
     message.className = kind || '';
+    if (text && toastEl) {
+      toastEl.textContent = text;
+      toastEl.className = 'toast show ' + (kind || '');
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(function () { toastEl.className = 'toast'; }, 3200);
+    }
   }
 
   function api(url, options) {
     return fetch(url, options).then(function (r) {
-      return r.json().then(function (body) {
-        if (!r.ok) throw new Error(body.error || 'Something went wrong.');
+      return r.text().then(function (text) {
+        var body = null;
+        try { body = JSON.parse(text); } catch (e) { /* not JSON (for example an HTML error page) */ }
+        if (!r.ok || body === null) {
+          throw new Error((body && body.error) || 'Could not reach the map service. Check your internet connection.');
+        }
         return body;
       });
     });
   }
+
+  // ---------- data layer ----------
+  // 'server' mode talks to the Flask app. 'local' mode (phone / installed web app)
+  // keeps places on the device and calls OpenStreetMap Nominatim directly.
+  var STORE_KEY = 'poi_map_locations_v1';
+  var memoryStore = null;
+  function readStore() {
+    try { return JSON.parse(localStorage.getItem(STORE_KEY) || '[]'); }
+    catch (e) { return memoryStore || []; }
+  }
+  function writeStore(list) {
+    memoryStore = list;
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(list)); } catch (e) { /* private mode */ }
+  }
+
+  var lastNominatim = 0;
+  var nominatimCache = {};
+  var nominatimQueue = Promise.resolve();
+  function nominatim(path, params) {
+    var query = Object.keys(params).sort().map(function (k) {
+      return encodeURIComponent(k) + '=' + encodeURIComponent(params[k]);
+    }).join('&');
+    var url = 'https://nominatim.openstreetmap.org' + path + '?' + query + '&accept-language=en';
+    if (nominatimCache[url]) return Promise.resolve(nominatimCache[url]);
+    // Nominatim allows 1 request per second: queue calls.
+    var job = nominatimQueue.then(function () {
+      var wait = Math.max(0, 1000 - (Date.now() - lastNominatim));
+      return new Promise(function (r) { setTimeout(r, wait); });
+    }).then(function () {
+      lastNominatim = Date.now();
+      return fetch(url);
+    }).then(function (r) {
+      if (!r.ok) throw new Error('bad status');
+      return r.json();
+    }).then(function (json) { nominatimCache[url] = json; return json; });
+    nominatimQueue = job.catch(function () {});
+    return job.catch(function () {
+      throw new Error('Could not reach the map search service. Check your internet connection.');
+    });
+  }
+
+  var data = {
+    search: function (q) {
+      if (!LOCAL) return api('/api/search?q=' + encodeURIComponent(q));
+      return nominatim('/search', { format: 'jsonv2', q: q, limit: 6 }).then(function (items) {
+        return { results: items.map(function (i) {
+          return { name: i.display_name || '', latitude: parseFloat(i.lat), longitude: parseFloat(i.lon) };
+        }) };
+      });
+    },
+    reverse: function (lat, lng) {
+      if (!LOCAL) return api('/api/reverse?lat=' + lat + '&lng=' + lng);
+      return nominatim('/reverse', { format: 'jsonv2', lat: lat.toFixed(5), lon: lng.toFixed(5), zoom: 18 })
+        .then(function (d) { return { address: d.error ? '' : (d.display_name || '') }; });
+    },
+    list: function () {
+      if (!LOCAL) return api('/get_locations');
+      return Promise.resolve(readStore().sort(function (a, b) { return b.id - a.id; }));
+    },
+    save: function (loc) {
+      if (!LOCAL) {
+        return api('/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(loc)
+        });
+      }
+      var list = readStore();
+      var id = list.reduce(function (m, x) { return Math.max(m, x.id || 0); }, 0) + 1;
+      list.push({
+        id: id, name: loc.name, category: loc.category || 'Other',
+        latitude: loc.latitude, longitude: loc.longitude,
+        description: loc.description || '', address: loc.address || ''
+      });
+      writeStore(list);
+      return Promise.resolve({ message: 'Location Saved Successfully' });
+    },
+    remove: function (id) {
+      if (!LOCAL) {
+        return fetch('/delete/' + id, { method: 'DELETE' }).then(function (r) {
+          if (!r.ok) throw new Error('Could not delete the location.');
+        });
+      }
+      writeStore(readStore().filter(function (x) { return x.id !== id; }));
+      return Promise.resolve();
+    }
+  };
 
   function validCoords(lat, lng) {
     return !isNaN(lat) && !isNaN(lng) && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180;
@@ -106,13 +207,80 @@
     filterCategory.appendChild(el('option', { value: name, text: name }));
   });
 
+  // ---------- mobile views (Map / Add / Saved tabs) ----------
+  var isMobile = function () { return window.matchMedia('(max-width: 860px)').matches; };
+  var tabButtons = document.querySelectorAll('.tabs button');
+  var addFab = $('add-fab');
+  var map = null; // assigned below
+  function setView(view) {
+    document.body.setAttribute('data-view', view);
+    Array.prototype.forEach.call(tabButtons, function (b) {
+      b.classList.toggle('active', b.getAttribute('data-view') === view);
+      b.setAttribute('aria-selected', b.getAttribute('data-view') === view ? 'true' : 'false');
+    });
+    updateFab();
+    if (view === 'map' && map) setTimeout(function () { map.invalidateSize(); }, 50);
+  }
+  var sheet = $('pick-sheet');
+  var sheetAddr = $('pick-address');
+  var sheetCoords = $('pick-coords');
+  function updateFab() {
+    var show = !!(pickedMarker && document.body.getAttribute('data-view') === 'map');
+    if (addFab) addFab.hidden = !show;
+    if (sheet) sheet.hidden = !show;
+    if (show) updateSheet();
+  }
+  function updateSheet() {
+    if (!sheet) return;
+    sheetCoords.textContent = latInput.value && lngInput.value ? latInput.value + ', ' + lngInput.value : '';
+    sheetAddr.textContent = addressInput.value.trim() || geoStatus.textContent || 'Pin placed.';
+  }
+  Array.prototype.forEach.call(tabButtons, function (b) {
+    b.addEventListener('click', function () { setView(b.getAttribute('data-view')); });
+  });
+  var sheetBtn = $('pick-add');
+  if (sheetBtn) sheetBtn.addEventListener('click', function () { setView('add'); });
+  if (addFab) addFab.addEventListener('click', function () { setView('add'); nameInput.focus(); });
+  window.addEventListener('resize', function () { if (map) map.invalidateSize(); });
+
   // ---------- map ----------
-  var map = L.map('map').setView([11.1271, 78.6569], 7);
+  map = L.map('map', { tap: true }).setView([11.1271, 78.6569], 7);
   L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 19,
     attribution: '&copy; OpenStreetMap contributors'
   }).addTo(map);
   L.control.scale({ imperial: false }).addTo(map);
+
+  // "Use my location" button (works on phones; needs https or localhost)
+  var LocateControl = L.Control.extend({
+    options: { position: 'topright' },
+    onAdd: function () {
+      var btn = L.DomUtil.create('button', 'locate-btn');
+      btn.type = 'button';
+      btn.title = 'Use my location';
+      btn.setAttribute('aria-label', 'Use my location');
+      btn.innerHTML = '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="3.5"/><circle cx="12" cy="12" r="8"/><line x1="12" y1="1" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="23"/><line x1="1" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="23" y2="12"/></svg>';
+      L.DomEvent.disableClickPropagation(btn);
+      L.DomEvent.on(btn, 'click', locateMe);
+      return btn;
+    }
+  });
+  map.addControl(new LocateControl());
+
+  function locateMe() {
+    if (!navigator.geolocation) { setStatus('Location is not supported on this device.', true); showMessage('Location is not supported on this device.', 'error'); return; }
+    setStatus('Getting your location…');
+    navigator.geolocation.getCurrentPosition(function (pos) {
+      setPicked(pos.coords.latitude, pos.coords.longitude, { fly: true, reverse: true, force: true });
+      showMessage('', '');
+    }, function (err) {
+      var text = err.code === 1
+        ? 'Location permission was denied. Allow it in your browser settings.'
+        : 'Could not get your location. On a phone this needs https (or the installed app).';
+      setStatus(text, true);
+      showMessage(text, 'error');
+    }, { enableHighAccuracy: true, timeout: 15000, maximumAge: 10000 });
+  }
 
   // ---------- the pin you are placing ----------
   // Put the pin at lat/lng. Options:
@@ -136,6 +304,7 @@
       latInput.value = lat.toFixed(6);
       lngInput.value = lng.toFixed(6);
     }
+    updateFab();
     if (opts.fly) map.flyTo(latlng, Math.max(map.getZoom(), 16));
     if (opts.reverse) lookupAddress(lat, lng, !!opts.force);
   }
@@ -148,13 +317,14 @@
     }
     var token = ++reverseToken;
     setStatus('Finding the address…');
-    api('/api/reverse?lat=' + lat + '&lng=' + lng)
+    data.reverse(lat, lng)
       .then(function (body) {
         if (token !== reverseToken) return;
         if (body.address) {
           addressInput.value = body.address;
           addressAuto = true;
           setStatus('Address found.');
+          updateSheet();
         } else {
           setStatus('No address found for this spot. You can type one.');
         }
@@ -207,7 +377,7 @@
     if (q.length < 2) { setStatus('Type an address first.', true); addressInput.focus(); return; }
     setStatus('Looking for this address…');
     findBtn.disabled = true;
-    api('/api/search?q=' + encodeURIComponent(q))
+    data.search(q)
       .then(function (body) {
         if (!body.results.length) {
           setStatus('Address not found. Try adding the city or pincode.', true);
@@ -238,7 +408,7 @@
     addressAuto = true;
     setStatus('Place selected. Add a name and press Save location.');
     if (!nameInput.value.trim()) nameInput.value = place.name.split(',')[0].trim();
-    nameInput.focus();
+    if (!isMobile()) nameInput.focus();
   }
 
   searchForm.addEventListener('submit', function (e) {
@@ -247,7 +417,7 @@
     if (q.length < 2) { showNote('Type at least 2 characters to search.', true); return; }
     searchBtn.disabled = true;
     showNote('Searching…');
-    api('/api/search?q=' + encodeURIComponent(q))
+    data.search(q)
       .then(function (body) {
         if (!body.results.length) { showNote('No places found. Try a different spelling or add the city.'); return; }
         resultsEl.textContent = '';
@@ -322,6 +492,7 @@
 
       var showBtn = el('button', { type: 'button', 'class': 'btn small ghost', text: 'Show on map' });
       showBtn.addEventListener('click', function () {
+        if (isMobile()) setView('map');
         map.flyTo([loc.latitude, loc.longitude], Math.max(map.getZoom(), 15));
         marker.openPopup();
       });
@@ -350,15 +521,12 @@
   }
 
   function refresh() {
-    return api('/get_locations').then(function (data) { locations = data; render(); });
+    return data.list().then(function (list) { locations = list; render(); });
   }
 
   function deleteLocation(id) {
-    fetch('/delete/' + id, { method: 'DELETE' })
-      .then(function (r) {
-        if (!r.ok) throw new Error('Could not delete the location.');
-        return refresh();
-      })
+    data.remove(id)
+      .then(refresh)
       .then(function () { showMessage('Location deleted.', 'ok'); })
       .catch(function (err) { showMessage(err.message, 'error'); });
   }
@@ -370,6 +538,7 @@
     reverseToken++;
     setStatus('');
     if (pickedMarker) { pickedMarker.remove(); pickedMarker = null; }
+    updateFab();
   }
   $('clear-btn').addEventListener('click', function () { clearForm(); showMessage('', ''); });
 
@@ -386,30 +555,80 @@
       return;
     }
 
-    api('/save', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: name,
-        category: categoryInput.value,
-        address: addressInput.value.trim(),
-        latitude: lat,
-        longitude: lng,
-        description: descInput.value.trim()
-      })
+    data.save({
+      name: name,
+      category: categoryInput.value,
+      address: addressInput.value.trim(),
+      latitude: lat,
+      longitude: lng,
+      description: descInput.value.trim()
     })
       .then(refresh)
       .then(function () {
         clearForm();
         showMessage('Saved "' + name + '".', 'ok');
         map.flyTo([lat, lng], Math.max(map.getZoom(), 15));
+        if (isMobile()) setView('saved');
       })
       .catch(function (err) { showMessage(err.message, 'error'); });
+  });
+
+  // ---------- backup: export / import ----------
+  $('export-btn').addEventListener('click', function () {
+    var blob = new Blob([JSON.stringify(locations, null, 2)], { type: 'application/json' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'poi-locations.json';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+  });
+  var importFile = $('import-file');
+  $('import-btn').addEventListener('click', function () { importFile.click(); });
+  importFile.addEventListener('change', function () {
+    var file = importFile.files[0];
+    importFile.value = '';
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function () {
+      var items;
+      try { items = JSON.parse(reader.result); } catch (e) { items = null; }
+      if (!Array.isArray(items)) { showMessage('That file is not a valid locations backup.', 'error'); return; }
+      var seen = {};
+      locations.forEach(function (l) { seen[l.name + '|' + l.latitude + '|' + l.longitude] = true; });
+      var chain = Promise.resolve();
+      var added = 0;
+      items.forEach(function (it) {
+        var lat = parseFloat(it.latitude), lng = parseFloat(it.longitude);
+        var name = String(it.name || '').trim();
+        if (!name || !validCoords(lat, lng) || seen[name + '|' + lat + '|' + lng]) return;
+        seen[name + '|' + lat + '|' + lng] = true;
+        added++;
+        chain = chain.then(function () {
+          return data.save({ name: name, category: it.category || 'Other', address: it.address || '',
+                             latitude: lat, longitude: lng, description: it.description || '' });
+        });
+      });
+      chain.then(refresh).then(function () {
+        showMessage(added + ' location' + (added === 1 ? '' : 's') + ' imported.', 'ok');
+      }).catch(function (err) { showMessage(err.message, 'error'); });
+    };
+    reader.readAsText(file);
   });
 
   filterSearch.addEventListener('input', render);
   filterCategory.addEventListener('change', render);
 
-  render();
-  fitAll();
+  setView('map');
+  if (LOCAL) {
+    refresh().then(fitAll);
+    if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+      window.addEventListener('load', function () {
+        navigator.serviceWorker.register('sw.js').catch(function () {});
+      });
+    }
+  } else {
+    render();
+    fitAll();
+  }
 })();

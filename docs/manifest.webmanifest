@@ -1,0 +1,16 @@
+{
+  "name": "POI Map",
+  "short_name": "POI Map",
+  "description": "Find places, drop pins on a map and save them with their address.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0f2f33",
+  "theme_color": "#0f2f33",
+  "icons": [
+    { "src": "static/icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "static/icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "static/icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

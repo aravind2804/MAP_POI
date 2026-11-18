@@ -7,7 +7,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, send_from_directory
 from database import get_connection, init_db
 
 # When packaged as an .exe, PyInstaller unpacks templates/static into a
@@ -126,6 +126,14 @@ def fetch_all_locations():
 @app.route("/")
 def home():
     return render_template("index.html", poi=fetch_all_locations())
+
+
+@app.route("/manifest.webmanifest")
+def manifest():
+    """Lets phones install the app to the home screen."""
+    return send_from_directory(
+        app.static_folder, "manifest.webmanifest", mimetype="application/manifest+json"
+    )
 
 
 @app.route("/save", methods=["POST"])
