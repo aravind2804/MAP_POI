@@ -24,6 +24,7 @@ html = html.replace(
     'window.POI_MODE = "server"; window.INITIAL_POI = {{ poi|tojson }};',
     'window.POI_MODE = "local"; window.INITIAL_POI = [];',
 )
+html = re.sub(r'\s*<a id="phone-link".*?</a>', "", html, flags=re.S)  # PC-only link
 assert "{{" not in html, "unreplaced template tag"
 open(os.path.join(OUT, "index.html"), "w", encoding="utf-8").write(html)
 

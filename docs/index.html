@@ -16,7 +16,13 @@
   <link rel="stylesheet" href="static/style.css">
 </head>
 <body data-view="map">
+  <div id="install-bar" class="install-bar" hidden>
+    <span id="install-text">Install POI Map as an app</span>
+    <button type="button" id="install-btn" class="btn small primary">Install POI Map</button>
+    <button type="button" id="install-close" class="install-close" aria-label="Close">&times;</button>
+  </div>
   <div class="shell">
+
 
     <header class="topbar">
       <div class="brand">
@@ -35,7 +41,6 @@
         <button id="search-btn" type="submit" class="btn primary">Search</button>
         <ul id="search-results" class="results" hidden></ul>
       </form>
-
       <div class="topbar-count"><strong id="total">0</strong> saved</div>
     </header>
 
@@ -100,6 +105,20 @@
 
       <main id="map" aria-label="Map"></main>
       <button id="add-fab" class="btn primary fab" type="button" hidden>Add details for this pin</button>
+      <section id="route-panel" class="route-panel" hidden aria-live="polite">
+        <div class="route-head">
+          <div class="route-title" id="route-title">Directions</div>
+          <button type="button" id="route-close" class="route-close" aria-label="Close directions">&times;</button>
+        </div>
+        <div class="route-modes" id="route-modes">
+          <button type="button" data-mode="car" class="active">Car</button>
+          <button type="button" data-mode="bike">Bike</button>
+          <button type="button" data-mode="foot">Walk</button>
+        </div>
+        <div class="route-summary" id="route-summary">Finding your location…</div>
+        <ol class="route-steps" id="route-steps"></ol>
+        <button type="button" id="route-gmaps" class="btn small ghost" hidden>Open in Google Maps</button>
+      </section>
       <div id="pick-sheet" class="sheet" hidden>
         <div class="sheet-text">
           <p id="pick-address" class="sheet-address">Pin placed.</p>

@@ -251,7 +251,7 @@
   }).addTo(map);
   L.control.scale({ imperial: false }).addTo(map);
 
-  // "Use my location" button (works on phones; needs https or localhost)
+  // "Use my location" button
   var LocateControl = L.Control.extend({
     options: { position: 'topright' },
     onAdd: function () {
@@ -261,25 +261,79 @@
       btn.setAttribute('aria-label', 'Use my location');
       btn.innerHTML = '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="3.5"/><circle cx="12" cy="12" r="8"/><line x1="12" y1="1" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="23"/><line x1="1" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="23" y2="12"/></svg>';
       L.DomEvent.disableClickPropagation(btn);
-      L.DomEvent.on(btn, 'click', locateMe);
+      L.DomEvent.on(btn, 'click', function () { locateMe({ manual: true }); });
       return btn;
     }
   });
   map.addControl(new LocateControl());
 
-  function locateMe() {
-    if (!navigator.geolocation) { setStatus('Location is not supported on this device.', true); showMessage('Location is not supported on this device.', 'error'); return; }
-    setStatus('Getting your location…');
+  // ---------- current location ----------
+  // Blue dot + accuracy circle for "you are here".
+  var meDot = null, meCircle = null;
+  function showMe(lat, lng, accuracy) {
+    var ll = L.latLng(lat, lng);
+    if (!meDot) {
+      meCircle = L.circle(ll, { radius: accuracy || 50, color: '#2563eb', weight: 1, fillOpacity: 0.12, interactive: false }).addTo(map);
+      meDot = L.circleMarker(ll, { radius: 8, color: '#fff', weight: 3, fillColor: '#2563eb', fillOpacity: 1, interactive: false }).addTo(map);
+    } else {
+      meDot.setLatLng(ll); meCircle.setLatLng(ll); meCircle.setRadius(accuracy || 50);
+    }
+  }
+
+  // Approximate (city-level) location from the internet connection. Used when GPS/location is off or blocked.
+  function ipLocate(manual) {
+    if (!manual) return;
+    setStatus('Getting your approximate location…');
+    fetch('https://ipwho.is/').then(function (r) { return r.json(); }).then(function (d) {
+      if (!d || d.success === false || typeof d.latitude !== 'number') throw new Error('no location');
+      showMe(d.latitude, d.longitude, 5000);
+      setPicked(d.latitude, d.longitude, { reverse: true, force: true });
+      map.flyTo([d.latitude, d.longitude], 12);
+      var text = 'Showing your approximate location' + (d.city ? ' (' + d.city + ')' : '') + '. Turn on device location for an exact spot.';
+      setStatus(text); showMessage(text, 'ok');
+    }).catch(function () {
+      var text = 'Could not get your location. Turn on location for this device and allow it for this app.';
+      setStatus(text, true); showMessage(text, 'error');
+    });
+  }
+
+  // opts.manual = the person pressed the button; otherwise it runs quietly when the app opens.
+  function locateMe(opts) {
+    var manual = !!(opts && opts.manual);
+    if (!navigator.geolocation) { ipLocate(manual); return; }
+    if (manual) setStatus('Getting your location…');
     navigator.geolocation.getCurrentPosition(function (pos) {
-      setPicked(pos.coords.latitude, pos.coords.longitude, { fly: true, reverse: true, force: true });
+      var lat = pos.coords.latitude, lng = pos.coords.longitude;
+      showMe(lat, lng, pos.coords.accuracy);
+      lastFix = { lat: lat, lng: lng, t: Date.now(), approx: false };
+      if (manual || !pickedMarker) setPicked(lat, lng, { fly: true, reverse: true, force: true });
+      else map.flyTo([lat, lng], Math.max(map.getZoom(), 16));
       showMessage('', '');
     }, function (err) {
-      var text = err.code === 1
-        ? 'Location permission was denied. Allow it in your browser settings.'
-        : 'Could not get your location. On a phone this needs https (or the installed app).';
-      setStatus(text, true);
-      showMessage(text, 'error');
+      if (manual && err.code !== 1) { ipLocate(true); return; }
+      if (manual) {   // permission denied
+        var text = 'Location permission was denied. Allow it in your browser/app settings, or tap the button again for an approximate spot.';
+        setStatus(text, true); showMessage(text, 'error');
+        ipLocate(true);
+      }
     }, { enableHighAccuracy: true, timeout: 15000, maximumAge: 10000 });
+  }
+
+  // When the app opens and location is on (or can be asked for), go straight to where you are.
+  function autoLocateSoon() {
+    window.addEventListener('load', function () {
+      setTimeout(function () {
+        try {
+          if (navigator.permissions && navigator.permissions.query) {
+            navigator.permissions.query({ name: 'geolocation' }).then(function (p) {
+              if (p.state !== 'denied') locateMe({ manual: false });
+            }, function () { locateMe({ manual: false }); });
+          } else {
+            locateMe({ manual: false });
+          }
+        } catch (e) { /* location not available; the button still works */ }
+      }, 900);
+    });
   }
 
   // ---------- the pin you are placing ----------
@@ -445,6 +499,154 @@
     if (e.key === 'Escape') hideResults();
   });
 
+  // ---------- directions (from my location to a saved place) ----------
+  var lastFix = null;          // my last known position
+  var routeLayer = null;       // the blue line on the map
+  var routeTarget = null;      // the saved place we are going to
+  var routeMode = 'car';
+  var routeToken = 0;
+  var MODES = {
+    car:  { service: 'routed-car',  google: 'driving' },
+    bike: { service: 'routed-bike', google: 'bicycling' },
+    foot: { service: 'routed-foot', google: 'walking' }
+  };
+  var routePanel = $('route-panel');
+  var routeSummary = $('route-summary');
+  var routeSteps = $('route-steps');
+  var routeTitle = $('route-title');
+  var routeGmaps = $('route-gmaps');
+
+  // My position: the real one if location is on, otherwise an approximate one.
+  function getFix() {
+    return new Promise(function (resolve, reject) {
+      if (lastFix && !lastFix.approx && Date.now() - lastFix.t < 120000) { resolve(lastFix); return; }
+      function approximate() {
+        fetch('https://ipwho.is/').then(function (r) { return r.json(); }).then(function (d) {
+          if (!d || d.success === false || typeof d.latitude !== 'number') throw new Error('no location');
+          lastFix = { lat: d.latitude, lng: d.longitude, t: Date.now(), approx: true };
+          showMe(d.latitude, d.longitude, 5000);
+          resolve(lastFix);
+        }).catch(reject);
+      }
+      if (!navigator.geolocation) { approximate(); return; }
+      navigator.geolocation.getCurrentPosition(function (pos) {
+        lastFix = { lat: pos.coords.latitude, lng: pos.coords.longitude, t: Date.now(), approx: false };
+        showMe(lastFix.lat, lastFix.lng, pos.coords.accuracy);
+        resolve(lastFix);
+      }, approximate, { enableHighAccuracy: true, timeout: 12000, maximumAge: 30000 });
+    });
+  }
+
+  function fmtDistance(m) { return m < 1000 ? Math.round(m / 10) * 10 + ' m' : (m / 1000).toFixed(m < 10000 ? 1 : 0) + ' km'; }
+  function fmtDuration(s) {
+    var min = Math.max(1, Math.round(s / 60));
+    return min < 60 ? min + ' min' : Math.floor(min / 60) + ' h ' + (min % 60) + ' min';
+  }
+  function stepText(step) {
+    var m = step.maneuver || {}, mod = m.modifier || '', road = step.name ? ' onto ' + step.name : '';
+    var turn = mod === 'straight' ? 'Continue straight' : 'Turn ' + mod;
+    switch (m.type) {
+      case 'depart': return 'Head ' + (mod || 'out') + (step.name ? ' on ' + step.name : '');
+      case 'arrive': return 'Arrive at your destination' + (mod ? ' (on the ' + mod + ')' : '');
+      case 'roundabout': case 'rotary': return 'At the roundabout take exit ' + (m.exit || '') + road;
+      case 'end of road': return 'At the end of the road turn ' + mod + road;
+      case 'fork': return 'Keep ' + mod + road;
+      case 'merge': return 'Merge ' + mod + road;
+      case 'on ramp': case 'off ramp': return 'Take the ramp ' + mod + road;
+      case 'continue': case 'new name': return 'Continue' + (step.name ? ' on ' + step.name : '');
+      default: return turn + road;
+    }
+  }
+
+  function fetchRoute(from, to, mode) {
+    var coords = from.lng + ',' + from.lat + ';' + to.longitude + ',' + to.latitude;
+    var query = '?overview=full&geometries=geojson&steps=true';
+    var urls = ['https://routing.openstreetmap.de/' + MODES[mode].service + '/route/v1/driving/' + coords + query];
+    if (mode === 'car') urls.push('https://router.project-osrm.org/route/v1/driving/' + coords + query);
+    function attempt(i) {
+      return fetch(urls[i]).then(function (r) { return r.json(); }).then(function (d) {
+        if (d && d.routes && d.routes.length) return d.routes[0];
+        if (d && d.code === 'NoRoute') throw new Error('noroute');
+        throw new Error('bad');
+      }).catch(function (err) {
+        if (err.message === 'noroute' || i + 1 >= urls.length) throw err;
+        return attempt(i + 1);
+      });
+    }
+    return attempt(0);
+  }
+
+  function clearRoute() {
+    routeToken++;
+    routeTarget = null;
+    if (routeLayer) { routeLayer.remove(); routeLayer = null; }
+    routePanel.hidden = true;
+    document.body.classList.remove('routing');
+  }
+
+  function showDirections(loc, mode) {
+    if (mode) routeMode = mode;
+    routeTarget = loc;
+    var token = ++routeToken;
+    if (isMobile()) setView('map');
+    document.body.classList.add('routing');
+    routePanel.hidden = false;
+    routeTitle.textContent = 'To ' + loc.name;
+    routeSummary.className = 'route-summary';
+    routeSummary.textContent = 'Finding your location\u2026';
+    routeSteps.textContent = '';
+    routeGmaps.hidden = true;
+    Array.prototype.forEach.call($('route-modes').children, function (b) {
+      b.classList.toggle('active', b.getAttribute('data-mode') === routeMode);
+    });
+    if (routeLayer) { routeLayer.remove(); routeLayer = null; }
+
+    getFix().then(function (from) {
+      if (token !== routeToken) return null;
+      routeSummary.textContent = 'Finding the route\u2026';
+      return fetchRoute(from, loc, routeMode).then(function (route) {
+        if (token !== routeToken) return;
+        routeLayer = L.geoJSON(route.geometry, { style: { color: '#2563eb', weight: 6, opacity: 0.85 }, interactive: false }).addTo(map);
+        map.fitBounds(routeLayer.getBounds(), { paddingTopLeft: [40, 40], paddingBottomRight: [40, isMobile() ? 280 : 60] });
+        routeSummary.textContent = fmtDistance(route.distance) + ' \u00B7 ' + fmtDuration(route.duration) + (from.approx ? '  (from your approximate location)' : '');
+        (route.legs || []).forEach(function (leg) {
+          (leg.steps || []).forEach(function (s) {
+            routeSteps.appendChild(el('li', {}, [
+              el('span', { text: stepText(s) + ' ' }),
+              el('small', { text: '(' + fmtDistance(s.distance) + ')' })
+            ]));
+          });
+        });
+        routeGmaps.hidden = false;
+        routeGmaps.onclick = function () {
+          openExternal('https://www.google.com/maps/dir/?api=1&origin=' + from.lat + ',' + from.lng +
+            '&destination=' + loc.latitude + ',' + loc.longitude + '&travelmode=' + MODES[routeMode].google);
+        };
+      });
+    }).catch(function (err) {
+      if (token !== routeToken) return;
+      routeSummary.className = 'route-summary error';
+      routeSummary.textContent = err && err.message === 'noroute'
+        ? 'No route found for this travel mode.'
+        : 'Could not get directions. Turn on location and check your internet connection.';
+    });
+  }
+
+  function openExternal(url) {
+    var onThisPc = !LOCAL && (location.hostname === '127.0.0.1' || location.hostname === 'localhost');
+    if (onThisPc) {   // inside the desktop window: open the system browser
+      fetch('/api/open_external', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: url }) })
+        .then(function (r) { if (!r.ok) throw new Error('x'); }).catch(function () { window.open(url, '_blank'); });
+    } else {
+      window.open(url, '_blank');
+    }
+  }
+
+  $('route-close').addEventListener('click', clearRoute);
+  Array.prototype.forEach.call($('route-modes').children, function (b) {
+    b.addEventListener('click', function () { if (routeTarget) showDirections(routeTarget, b.getAttribute('data-mode')); });
+  });
+
   // ---------- saved locations list ----------
   function visibleLocations() {
     var query = filterSearch.value.trim().toLowerCase();
@@ -489,6 +691,7 @@
         .bindPopup(popupFor(loc))
         .addTo(map);
       markers[loc.id] = marker;
+      marker.on('click', function () { showDirections(loc); });
 
       var showBtn = el('button', { type: 'button', 'class': 'btn small ghost', text: 'Show on map' });
       showBtn.addEventListener('click', function () {
@@ -497,10 +700,13 @@
         marker.openPopup();
       });
 
+      var dirBtn = el('button', { type: 'button', 'class': 'btn small primary', text: 'Directions' });
+      dirBtn.addEventListener('click', function () { showDirections(loc); });
+
       var deleteBtn = el('button', { type: 'button', 'class': 'btn small danger', text: 'Delete' });
       armDelete(deleteBtn, loc);
 
-      listEl.appendChild(el('li', {}, [
+      var item = el('li', { 'class': 'clickable' }, [
         el('div', { 'class': 'item-name', text: loc.name }),
         el('div', { 'class': 'item-cat' }, [
           el('span', { 'class': 'dot', style: '--c:' + colorFor(loc.category) }),
@@ -509,8 +715,13 @@
         loc.address ? el('p', { 'class': 'item-address', text: loc.address }) : el('span'),
         loc.description ? el('p', { 'class': 'item-desc', text: loc.description }) : el('span'),
         el('div', { 'class': 'item-coords', text: Number(loc.latitude).toFixed(6) + ', ' + Number(loc.longitude).toFixed(6) }),
-        el('div', { 'class': 'item-actions' }, [showBtn, deleteBtn])
-      ]));
+        el('div', { 'class': 'item-actions' }, [dirBtn, showBtn, deleteBtn])
+      ]);
+      item.addEventListener('click', function (e) {
+        if (e.target.closest && e.target.closest('button')) return;
+        showDirections(loc);
+      });
+      listEl.appendChild(item);
     });
   }
 
@@ -620,6 +831,7 @@
   filterCategory.addEventListener('change', render);
 
   setView('map');
+  autoLocateSoon();
   if (LOCAL) {
     refresh().then(fitAll);
     if ('serviceWorker' in navigator && location.protocol !== 'file:') {
@@ -630,5 +842,61 @@
   } else {
     render();
     fitAll();
+  }
+})();
+
+(function () {
+  var link = document.getElementById('phone-link');
+  if (link && window.POI_MODE === 'local') link.hidden = true;
+})();
+
+(function () {
+  if (window.POI_MODE !== 'local') return;   // only the hosted phone (https) version can be installed
+  var bar = document.getElementById('install-bar');
+  var btn = document.getElementById('install-btn');
+  var text = document.getElementById('install-text');
+  var close = document.getElementById('install-close');
+  if (!bar) return;
+  var installed = (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) || window.navigator.standalone;
+  if (installed) return;
+  var ua = navigator.userAgent;
+  var deferred = null;
+  function show(msg, showBtn, label, handler) {
+    text.textContent = msg;
+    btn.hidden = !showBtn;
+    if (label) btn.textContent = label;
+    btn.onclick = handler || null;
+    bar.hidden = false;
+  }
+  close.addEventListener('click', function () { bar.hidden = true; });
+
+  // Instagram / Facebook / other in-app browsers cannot install apps: send the person to Chrome / Safari.
+  if (/Instagram|FBAN|FBAV|FB_IAB|Line\/|Snapchat|MicroMessenger/i.test(ua)) {
+    if (/android/i.test(ua)) {
+      var target = 'intent://' + location.host + location.pathname + '#Intent;scheme=https;package=com.android.chrome;end';
+      show('To install the app, open this page in Chrome.', true, 'Open in Chrome', function () { location.href = target; });
+    } else {
+      show('To install: tap the \u22EF menu, choose "Open in Safari", then Share \u2192 Add to Home Screen.', false);
+    }
+    return;
+  }
+
+  window.addEventListener('beforeinstallprompt', function (e) {
+    e.preventDefault(); deferred = e;
+    show('Install POI Map as an app', true, 'Install POI Map', function () {
+      if (!deferred) return;
+      deferred.prompt();
+      deferred.userChoice.then(function () { deferred = null; bar.hidden = true; });
+    });
+  });
+  window.addEventListener('appinstalled', function () { bar.hidden = true; });
+
+  if (/iphone|ipad|ipod/i.test(ua)) {   // iPhone has no install button
+    show('To install: tap Share, then "Add to Home Screen".', false);
+  } else {
+    // If Chrome has not offered the install prompt after a few seconds, explain the manual way.
+    setTimeout(function () {
+      if (!deferred && bar.hidden) show('To install: tap the \u22EE menu, then "Install app" or "Add to Home screen".', false);
+    }, 4000);
   }
 })();

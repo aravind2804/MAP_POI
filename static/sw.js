@@ -1,6 +1,6 @@
 // Service worker: makes the phone version open instantly and work offline
 // (saved places and the app itself; map tiles/search still need internet).
-var CACHE = 'poi-map-v2';
+var CACHE = 'poi-map-v5';
 var SHELL = [
   './', 'index.html', 'manifest.webmanifest',
   'static/style.css', 'static/app.js',

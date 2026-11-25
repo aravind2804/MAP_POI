@@ -1,5 +1,7 @@
+import io
 import json
 import os
+import socket
 import sys
 import threading
 import time
@@ -7,7 +9,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from flask import Flask, render_template, request, jsonify, send_from_directory
+from flask import Flask, render_template, render_template_string, request, jsonify, send_from_directory
 from database import get_connection, init_db
 
 # When packaged as an .exe, PyInstaller unpacks templates/static into a
@@ -185,6 +187,96 @@ def delete_location(id):
     conn.close()
 
     return jsonify({"message": "Location Deleted Successfully"})
+
+
+# -----------------------------
+# "Use on phone": shows this PC's address + a QR code
+# -----------------------------
+def lan_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))  # nothing is sent; just finds your network address
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def qr_svg(text):
+    try:
+        import qrcode
+        import qrcode.image.svg
+        img = qrcode.make(text, image_factory=qrcode.image.svg.SvgPathImage, box_size=10)
+        buf = io.BytesIO()
+        img.save(buf)
+        return buf.getvalue().decode("utf-8")
+    except Exception:
+        return ""
+
+
+PHONE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>POI Map on your phone</title>
+<style>body{font-family:system-ui,sans-serif;max-width:620px;margin:40px auto;padding:0 20px;color:#16302f}
+a{color:#0f766e}.qr{width:230px;height:230px;background:#fff;padding:8px;border-radius:12px;border:1px solid #dde8e6}
+code{background:#eef3f2;padding:4px 8px;border-radius:6px;font-size:1rem;word-break:break-all}li{margin:6px 0}
+.box{border:1px solid #dde8e6;border-radius:14px;padding:18px 20px;margin:18px 0}.muted{color:#5d7775;font-size:.92rem}</style></head><body>
+<a href="/">&larr; Back to the map</a><h1>Get POI Map on your phone</h1>
+
+<div class="box"><h2>1. Install it as a phone app</h2>
+<p>Scan with your phone camera. It opens the app over <b>https</b>, which lets the phone install it and run it on its own, with no PC needed.</p>
+<div class="qr">{{ qr_install|safe }}</div><p><code>{{ install_url }}</code></p>
+<ul><li><b>Android (Chrome):</b> tap <b>Install POI Map</b> at the top of the page, or menu &#8942; &rarr; <b>Install app</b>.</li>
+<li><b>iPhone (Safari):</b> Share &rarr; <b>Add to Home Screen</b>.</li></ul>
+<p class="muted">Places saved in the phone app stay on the phone. Use Export backup / Import backup in the Saved section to move them to the PC.</p>
+{% if not hosted %}<p class="muted"><b>This address is not online yet.</b> Run <code>publish_phone.bat</code> once, turn on GitHub Pages (see README), then put your https link in <code>phone_url.txt</code>.</p>{% endif %}</div>
+
+<div class="box"><h2>2. Or use this PC's app (same Wi-Fi, PC must be running)</h2>
+<div class="qr">{{ qr_lan|safe }}</div><p><code>{{ lan_url }}</code></p>
+<p class="muted">This opens in the phone's browser and cannot be installed as a real app (phones only allow that over https). Places are shared with the PC.</p></div>
+</body></html>"""
+
+
+def read_install_url():
+    """The https address of the phone app (see phone_url.txt)."""
+    from database import DATA_DIR
+    for folder in (DATA_DIR, BASE_DIR, os.path.dirname(os.path.abspath(__file__))):
+        try:
+            with open(os.path.join(folder, "phone_url.txt"), encoding="utf-8") as f:
+                url = f.read().strip()
+            if url.startswith("https://"):
+                return url
+        except OSError:
+            continue
+    return ""
+
+
+@app.route("/api/open_external", methods=["POST"])
+def open_external():
+    """Desktop window only: open a Google Maps link in the PC's normal browser."""
+    if request.remote_addr not in ("127.0.0.1", "::1"):
+        return jsonify({"error": "Only available on this PC."}), 403
+    url = str((request.get_json(silent=True) or {}).get("url", ""))
+    if not url.startswith("https://www.google.com/maps/"):
+        return jsonify({"error": "Link not allowed."}), 400
+    import webbrowser
+    webbrowser.open(url)
+    return jsonify({"ok": True})
+
+
+@app.route("/phone")
+def phone():
+    port = request.host.split(":")[-1] if ":" in request.host else "80"
+    lan_url = f"http://{lan_ip()}:{port}"
+    install_url = read_install_url()
+    return render_template_string(
+        PHONE_PAGE,
+        lan_url=lan_url,
+        qr_lan=qr_svg(lan_url),
+        install_url=install_url or lan_url,
+        qr_install=qr_svg(install_url or lan_url),
+        hosted=bool(install_url),
+    )
 
 
 if __name__ == "__main__":
